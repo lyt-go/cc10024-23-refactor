@@ -5,36 +5,13 @@ from typing import Any
 
 from app.store import store
 from app.services.base import BaseModuleService, register_hook
+from app.services.run_receipt import RECOVERY_RECEIPT, register_collection_receipt
 from app import persistence as persist
 
 
 def _record_recovery_to_history(entry: dict[str, Any]) -> None:
-    """恢复任务确认恢复后写入run_history。"""
-    run_rows = store.rows("run_history")
-    new_id = max((int(r.get("id", 0)) for r in run_rows), default=0) + 1
-    record = {
-        "id": new_id,
-        "记录编号": f"RUN-RECOVER-{new_id:04d}",
-        "关联计划": entry.get("关联计划", ""),
-        "开始时间": persist.now_iso(),
-        "结束时间": "",
-        "采集行数": "恢复重采",
-        "失败行数": entry.get("已重试次数", "0"),
-        "执行日志": f"从error_recover任务{entry.get('任务编号')}恢复",
-        "异常摘要": entry.get("错误类型", ""),
-        "status": "运行中",
-        "pending": True,
-        "abnormal": False,
-        "version": "",
-        "updated_at": persist.now_iso(),
-    }
-    run_rows.append(record)
-    persist.append_jsonl("runs", "run_history.jsonl", {
-        "module": "run_history", "entity": "运行记录", "entry_id": new_id,
-        "status": "运行中", "version": "", "action": "auto_create_from_recovery",
-        "timestamp": persist.now_iso(), "abnormal": False,
-        "source_module": "error_recover", "source_id": entry.get("id"),
-    })
+    """恢复任务确认恢复后按共用回执规则登记采集运行，来源标记为首次恢复。"""
+    register_collection_receipt(RECOVERY_RECEIPT, entry)
 
 register_hook("error_recover", "确认恢复", _record_recovery_to_history)
 

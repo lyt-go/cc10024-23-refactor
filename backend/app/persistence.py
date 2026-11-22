@@ -47,6 +47,25 @@ def append_jsonl(sub: str, filename: str, record: dict[str, Any]) -> str:
     return path
 
 
+def repair_jsonl_tail(sub: str, filename: str) -> None:
+    """写入中断后清掉末尾没有换行的半行，避免后续追加接在半行后面。"""
+    path = data_path(sub, filename)
+    if not os.path.exists(path):
+        return
+    with open(path, "rb+") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            return
+        f.seek(-1, os.SEEK_END)
+        if f.read(1) == b"\n":
+            return
+        f.seek(0)
+        data = f.read()
+        last_newline = data.rfind(b"\n")
+        f.seek(0)
+        f.truncate(last_newline + 1 if last_newline >= 0 else 0)
+
+
 def read_jsonl(sub: str, filename: str) -> list[dict[str, Any]]:
     path = data_path(sub, filename)
     if not os.path.exists(path):
@@ -55,8 +74,13 @@ def read_jsonl(sub: str, filename: str) -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
+            except json.JSONDecodeError:
+                # 追加过程中断可能留下半行；已完整落盘的记录仍然可读。
+                continue
     return records
 
 

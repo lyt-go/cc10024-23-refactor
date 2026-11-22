@@ -6,7 +6,30 @@ from typing import Any
 
 from app.store import store
 from app.services.base import BaseModuleService, register_hook
+from app.services.run_receipt import (
+    BATCH_RECEIPT,
+    RECEIPT_SPECS,
+    RECOVERY_RECEIPT,
+    collection_receipt_state,
+    reconcile_collection_receipts,
+)
 from app import persistence as persist
+
+
+def _source_for_action(action: str) -> dict[str, str]:
+    """把运行日志里的回执动作翻译成当初的触发来源（批次结束/首次恢复）。"""
+    for spec in RECEIPT_SPECS:
+        if spec.action == action:
+            return {"source_module": spec.source_module, "trigger": spec.trigger}
+    return {"source_module": "", "trigger": ""}
+
+
+def _source_for_code(code: str) -> dict[str, str]:
+    """内存记录没有action，按记录编号前缀识别回执来源。"""
+    for spec in RECEIPT_SPECS:
+        if str(code).startswith(f"{spec.prefix}-"):
+            return {"source_module": spec.source_module, "trigger": spec.trigger}
+    return {"source_module": "", "trigger": ""}
 
 
 def _auto_dedup_and_check_on_confirm(entry: dict[str, Any]) -> None:
@@ -63,20 +86,47 @@ class RunHistoryService(BaseModuleService):
         """获取最近的运行记录，优先从JSONL文件读取完整历史。"""
         file_runs = persist.read_jsonl("runs", "run_history.jsonl")
         memory_runs = store.rows(self.MODULE)
-        # 合并内存和文件中的记录，按时间排序
-        combined = file_runs[-limit:] + [
-            {
+        # 内存记录对应到文件里的同一条回执时，沿用文件记录的触发动作和来源。
+        file_by_entry = {
+            int(record.get("entry_id", 0)): record
+            for record in file_runs
+            if record.get("entry_id") is not None
+        }
+
+        def memory_view(row: dict[str, Any]) -> dict[str, Any]:
+            origin = file_by_entry.get(int(row.get("id", 0)))
+            if origin is not None:
+                action = origin.get("action", "")
+                source = _source_for_action(str(action))
+            else:
+                action = row.get("status", "")
+                source = _source_for_code(str(row.get("记录编号", "")))
+            return {
                 "module": self.MODULE,
                 "entity": self.ENTITY,
-                "entry_id": r.get("id"),
-                "status": r.get("status"),
-                "version": r.get("version", ""),
-                "action": r.get("status", ""),
-                "timestamp": r.get("updated_at", ""),
-                "abnormal": r.get("abnormal", False),
-            } for r in memory_runs
+                "entry_id": row.get("id"),
+                "status": row.get("status"),
+                "version": row.get("version", ""),
+                "action": action,
+                "timestamp": row.get("updated_at", ""),
+                "abnormal": row.get("abnormal", False),
+                **source,
+            }
+
+        combined = [
+            {**record, **_source_for_action(str(record.get("action", "")))}
+            for record in file_runs[-limit:]
         ]
+        combined += [memory_view(row) for row in memory_runs]
         return combined[-limit:]
+
+    def collection_receipts(self) -> dict[str, Any]:
+        """按来源汇总采集运行回执的提交结果。"""
+        return collection_receipt_state()
+
+    def reconcile_receipts(self) -> dict[str, Any]:
+        """核对已提交的采集运行回执与运行日志是否一一对应。"""
+        return reconcile_collection_receipts()
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
@@ -84,6 +134,14 @@ class RunHistoryService(BaseModuleService):
         file_runs = persist.read_jsonl("runs", "run_history.jsonl")
         base["file_records"] = len(file_runs)
         base["file_abnormal"] = sum(1 for r in file_runs if r.get("abnormal"))
+        # 触发来源识别
+        base["batch_runs"] = sum(1 for r in file_runs if r.get("action") == BATCH_RECEIPT.action)
+        base["recovery_runs"] = sum(
+            1 for r in file_runs if r.get("action") == RECOVERY_RECEIPT.action)
+        receipts = collection_receipt_state()
+        base["receipt_committed"] = receipts["committed_count"]
+        base["receipt_pending"] = receipts["pending_count"]
+        base["receipt_failed"] = receipts["failed_count"]
         # 关联的去重报告
         dedup_reports = persist.read_jsonl("reports", "dedup_report.jsonl")
         base["triggered_dedup"] = len([r for r in dedup_reports if r.get("trigger") == "run_history_confirm"])
